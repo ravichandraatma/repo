@@ -27,6 +27,35 @@
     <TypeScriptCompile Include="app.ts" />
   </ItemGroup>
   <ItemGroup>
+    <Content Include="Another\Resume\InterViewOne\.net.Dixon Thomas.net.docx" />
+    <Content Include="Another\Resume\InterViewOne\.net.Rajesh Prasad Resume.pdf" />
+    <Content Include="Another\Resume\InterViewOne\.net.Resume.doc" />
+    <Content Include="Another\Resume\InterViewOne\.net.Sakshi Gupta.net.pdf" />
+    <Content Include="Another\Resume\InterViewOne\.net.Shweta Mangla.docx" />
+    <Content Include="Another\Resume\InterViewOne\Abdul Kadir Shekhani.docx" />
+    <Content Include="Another\Resume\InterViewOne\Anoop Garg - Project Manager.pdf" />
+    <Content Include="Another\Resume\InterViewOne\Elangovan_P_Bengaluru_-_Bangalore_7.00_yrs.doc" />
+    <Content Include="Another\Resume\InterViewOne\KRISHNA KAMAL KOTAL.DOC" />
+    <Content Include="Another\Resume\InterViewOne\Lead_QA_9Yrs_Shree_Kant_Pandey.docx" />
+    <Content Include="Another\Resume\InterViewOne\Manoj Kumar.doc" />
+    <Content Include="Another\Resume\InterViewOne\ManojKumar.pdf" />
+    <Content Include="Another\Resume\InterViewOne\MEERANMOHIDEEN.doc" />
+    <Content Include="Another\Resume\InterViewOne\Neha_Bansal.doc" />
+    <Content Include="Another\Resume\InterViewOne\Nilesh Kumar.docx" />
+    <Content Include="Another\Resume\InterViewOne\Preeti Bhatnagar.docx" />
+    <Content Include="Another\Resume\InterViewOne\Resume Prashant Kumar.docx" />
+    <Content Include="Another\Resume\InterViewOne\Resume_Prashant Kumar pb.docx" />
+    <Content Include="Another\Resume\InterViewOne\Resume_Preeti Saini.docx" />
+    <Content Include="Another\Resume\InterViewOne\Resume_Selvan .doc" />
+    <Content Include="Another\Resume\InterViewOne\Sandeep Kumar Dixit.docx" />
+    <Content Include="Another\Resume\InterViewOne\sanjay jha_SAP BASIS.docx" />
+    <Content Include="Another\Resume\InterViewOne\SantoshPawar.doc" />
+    <Content Include="Another\Resume\InterViewOne\Saravanan.doc" />
+    <Content Include="Another\Resume\InterViewOne\Sobha_Antony_Bengaluru_-_Bangalore_6 00_yrs.doc" />
+    <Content Include="Another\Resume\InterViewOne\Sujit Jhare.docx" />
+    <Content Include="Another\Resume\InterViewOne\Swati_Jain_Resume.doc" />
+    <Content Include="Another\Resume\InterViewOne\vandita sharma-resume.docx" />
+    <Content Include="Another\Resume\Ravi_Atma.doc" />
     <None Include="web.Debug.config">
       <DependentUpon>web.config</DependentUpon>
     </None>
@@ -34,6 +63,7 @@
       <DependentUpon>web.config</DependentUpon>
     </None>
   </ItemGroup>
+  <ItemGroup />
   <PropertyGroup>
     <VisualStudioVersion Condition="'$(VisualStudioVersion)' == ''">12.0</VisualStudioVersion>
   </PropertyGroup>
