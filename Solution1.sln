@@ -1,9 +1,11 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio 15
-VisualStudioVersion = 15.0.26730.15
+# Visual Studio 2013
+VisualStudioVersion = 12.0.30723.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ConsoleTest", "ConsoleTest\ConsoleTest.csproj", "{7F9D663C-5252-4201-85E4-D2EF6851F210}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TypeScriptHTMLApp", "TypeScriptHTMLApp\TypeScriptHTMLApp.csproj", "{26535AD3-0F7C-4F7F-BEA8-F45F8C6573EF}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -15,6 +17,10 @@ Global
 		{7F9D663C-5252-4201-85E4-D2EF6851F210}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{7F9D663C-5252-4201-85E4-D2EF6851F210}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{7F9D663C-5252-4201-85E4-D2EF6851F210}.Release|Any CPU.Build.0 = Release|Any CPU
+		{26535AD3-0F7C-4F7F-BEA8-F45F8C6573EF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{26535AD3-0F7C-4F7F-BEA8-F45F8C6573EF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{26535AD3-0F7C-4F7F-BEA8-F45F8C6573EF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{26535AD3-0F7C-4F7F-BEA8-F45F8C6573EF}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
