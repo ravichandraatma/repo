@@ -66,6 +66,7 @@
     </None>
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="crmHelper\Topics\AddSettingsToSettingsHome.cs" />
     <Compile Include="crmHelper\Topics\CustomizeSysFormsAndPublish.cs" />
     <Compile Include="crmHelper\Topics\workingWithEntityImage.cs" />
   </ItemGroup>
