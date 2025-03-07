@@ -1,62 +1,947 @@
-private void ExecuteImportRequest(CrmConnection connection, string zipFilePath)
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+using Ellucian.Core.Crm.Base.Data;
+using Ellucian.Core.Crm.Base.Metadata;
+using Ionic.Zip;
+using Microsoft.Crm.Sdk.Messages;
+using System.Diagnostics;
+using Ellucian.Core.Crm.Base.Utilities.Logging;
+using Ellucian.Core.Installation;
+using System.Xml;
+using System.Threading;
+using Microsoft.Xrm.Sdk;
+using Microsoft.Xrm.Sdk.Query;
+
+namespace Ellucian.Crm.Tools.Core
 {
-    //SolutionImportExportTool
-    //ImportSolutionRequest importRequest = new ImportSolutionRequest();
-    //importRequest.ConvertToManaged = false;
-    //importRequest.OverwriteUnmanagedCustomizations = false;
-    //importRequest.PublishWorkflows = true;
-    //importRequest.CustomizationFile = File.ReadAllBytes(zipFilePath);
-    //ImportSolutionResponse importResponse = (ImportSolutionResponse)connection.OrganizationService.Execute(importRequest);
-
-    ImportSolutionAsyncRequest asyncImportRequest = new ImportSolutionAsyncRequest
+    public class SolutionImportExportTool : CrmTool
     {
-        CustomizationFile = File.ReadAllBytes(zipFilePath),
-        PublishWorkflows = true,
-        OverwriteUnmanagedCustomizations = false,
-        ConvertToManaged = false
-    };
-    var response = (ImportSolutionAsyncResponse)connection.OrganizationService.Execute(asyncImportRequest);
-    //Guid asyncJobId = resp.AsyncOperationId;
-    var importSucceeded = CheckImportStatus(connection.OrganizationService, response.AsyncOperationId, Guid.Parse(response.ImportJobKey));
-
-}
-
-public bool CheckImportStatus(IOrganizationService service, Guid asyncOperationId, Guid importJobKey)
-{
-    var finished = false;
-    Entity asyncOperation = null;
-    // Wait until the async job is finished
-    while (!finished)
-    {
-        asyncOperation = service.Retrieve("asyncoperation", asyncOperationId, new ColumnSet("statecode", "statuscode"));
-        OptionSetValue statecode = (OptionSetValue)asyncOperation["statecode"];
-        if (statecode.Value == 3)
+        public enum OperationType
         {
-            finished = true;
+            Import,
+            Export,
+            CoreUpdate
         }
-        else
+
+        class SolutionImportExportToolOptions : BaseToolOptions
         {
-            Environment.WriteLine($"WaitingForDataverse , {asyncOperationId}, {importJobKey}");
-            Thread.Sleep(10000);
+            public OperationType Action { get; set; }
+            public TargetOrganization TargetOrganization { get; set; }
+            public bool PackUnpack { get; set; }
+            public string SolutionPackagerLoc { get; set; }
+            public string MapFile { get; set; }
+            public string TargetVersion { get; set; }
+            public bool Localize { get; set; }
+            public string Gacutil { get; set; }
+            public string CoreLocation { get; set; }
+            public bool CheckoutSolutionZips { get; set; }
+        }
+
+        SolutionImportExportToolOptions Options { get; set; }
+
+        private const string _CustomizationsFileName = "customizations.xml";
+        private const string _SolutionFileName = "solution.xml";
+        private const string _UnmanagedSuffix = "";
+        private const string _ManagedSuffix = "_managed";
+        private const string _UpdateCoreTempLocation = "_ManagedCoreUpdateTemp";
+        private const string _UnpackedDirectorySuffix = "Unpacked";
+        private const string _PackedZipSuffix = "Packed.zip";
+        private const string _CoreLibraries = "CoreLibraries";
+        private const string _ManagedCore = "DatatelCore_managed.zip";
+        private const string _ManagedCoreResources = "EllucianCoreResources_managed.zip";
+        private PacCliHelper pacCliHelper;
+
+        public override bool Execute()
+        {
+            pacCliHelper = PacCliHelper.GetInstance(Settings, Environment);
+            Options = new SolutionImportExportToolOptions();
+            Options.CheckoutSolutionZips = true;
+            Options.LoadParameters(Parameters);
+
+            var operation = Options.Action;
+            var organization = Options.TargetOrganization;
+
+            switch (operation)
+            {
+                case OperationType.Import:
+                    PerformImport(Settings, organization);
+                    break;
+                case OperationType.Export:
+                    PerformExport(Settings, organization);
+                    break;
+                case OperationType.CoreUpdate:
+                    if (string.IsNullOrEmpty(Options.CoreLocation))
+                    {
+                        Options.CoreLocation = _CoreLibraries;
+                    }
+                    PerformCoreLibrariesImport(Settings);
+                    break;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Exports unmanaged solutions in the core and business organization to create unmanaged and managed solution packaes
+        /// </summary>
+        /// <param name="settings"></param>
+        /// <param name="organization"></param>
+        private void PerformExport(ToolSettings settings, TargetOrganization organization)
+        {
+            if (organization == TargetOrganization.Both || organization == TargetOrganization.Core)
+            {
+                // Export managed and unmanaged versions of the unmanaged solutions in the Core org
+                CrmConnection coreConnection = settings.CreateConnection(settings.CoreOrganization);
+                foreach (var solution in settings.CoreOrganization.Solutions.Where(x => x.Type == SolutionType.Unmanaged))
+                {
+                    ExportAndFixSolution(coreConnection, solution.UniqueName, settings.CustomizationsDirectory);
+                }
+            }
+
+            if (organization == TargetOrganization.Both || organization == TargetOrganization.Business)
+            {
+                CrmConnection recruiterConnection = settings.CreateConnection(settings.ProductOrganization);
+
+                string skipCoreUpdate = "false";
+                Parameters.TryGetValue("SkipCoreUpdate", out skipCoreUpdate);
+
+                if (Convert.ToBoolean(skipCoreUpdate) == false)
+                {
+                    // Update the managed core solution in business organizations
+                    UpdateManagedCore(recruiterConnection, settings.CoreOrganization, settings.ProductOrganization, settings.CustomizationsDirectory);
+                }
+
+                // Export managed and unmanaged versions of the unmanaged solutions in the business orgs
+                foreach (var solution in settings.ProductOrganization.Solutions.Where(x => x.Type == SolutionType.Unmanaged))
+                {
+                    ExportAndFixSolution(recruiterConnection, solution.UniqueName, settings.CustomizationsDirectory);
+                }
+            }
+
+            Environment.WriteLine("\nSolution export finished!");
+        }
+
+
+
+        private void UnPackForCheckin(string folder, string zipFile)
+        {
+            Process proc;
+
+            if (Settings.OnlineCrm)
+            {
+                pacCliHelper.SolutionUnPack(folder, zipFile, Options.MapFile, Options.Localize);
+            }
+            else
+            {
+                string argstring = null;
+
+                string[] args = new string[9];
+                args[0] = "/action:Extract";
+                args[1] = "/zipfile:" + zipFile;
+                args[2] = "/folder:" + folder;
+                args[3] = "/packagetype:Both";
+                if (!String.IsNullOrEmpty(Options.MapFile))
+                {
+                    args[4] = "/map:" + Options.MapFile;
+                }
+                else
+                {
+                    args[4] = "";
+                }
+                args[5] = "/allowDelete:Yes";
+                args[6] = "/errorlevel:Warning";
+                args[7] = "/clobber";
+                if (Options.Localize)
+                {
+                    args[8] = "/localize";
+                }
+                else
+                {
+                    args[8] = "";
+                }
+
+                argstring = String.Join(" ", args);
+
+
+                Environment.WriteLine($"Unpacking with arguments {argstring}...");
+                proc = new Process();
+                proc.StartInfo.UseShellExecute = false;
+                proc.StartInfo.RedirectStandardOutput = true;
+                proc.StartInfo.RedirectStandardError = true;
+                proc.StartInfo.FileName = Environment.GetSolutionFileName(Options.SolutionPackagerLoc);
+                proc.StartInfo.Arguments = argstring;
+                proc.StartInfo.WorkingDirectory = Settings.WorkspaceDirectory;
+                proc.OutputDataReceived += proc_OutputDataReceived;
+                proc.ErrorDataReceived += proc_OutputDataReceived;
+                proc.Start();
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+                proc.WaitForExit();
+                Environment.WriteLine("Exited with code: " + proc.ExitCode);
+            }
+        }
+
+
+        private bool PackForImport(string folder, string zipFile)
+        {
+            return PackSolution(pacCliHelper, Environment, folder, zipFile, Options.MapFile, Options.Localize, "Unmanaged", Options.SolutionPackagerLoc, Settings.WorkspaceDirectory, proc_OutputDataReceived);
+        }
+
+        /// <summary>
+        /// Pack a solution
+        /// This method is meant to be the one place where we pack solutions, so as to always be doing it the same way
+        /// This is used from at least this tool and the SolutionLocalizationTool
+        /// </summary>
+        /// <param name="environment"></param>
+        /// <param name="folder"></param>
+        /// <param name="zipFile"></param>
+        /// <param name="mapFile"></param>
+        /// <param name="localize"></param>
+        /// <param name="solutionPackagerLocation"></param>
+        /// <param name="workspaceDirectory"></param>
+        /// <param name="outputHandler"></param>
+        /// <returns></returns>
+        public static bool PackSolution(PacCliHelper pacCliHelper, IEnvironment environment, string folder, string zipFile, string mapFile, bool localize, string packageType, string solutionPackagerLocation, string workspaceDirectory, DataReceivedEventHandler outputHandler)
+        {
+            if (localize)
+                throw new InvalidOperationException("EXCEPTION: 'localize' option should be set to false in order to prevent inadvertent overwrite of localized form label values. Abandoning solution pack.");
+
+            environment.WriteLine("Packing solution files for import...");
+
+            if (pacCliHelper.Settings.OnlineCrm)
+            {
+                return pacCliHelper.SolutionPack(folder, zipFile, mapFile, localize, packageType);
+            }
+            else
+            {
+                string[] args = new string[9];
+                args[0] = "/action:Pack";
+                args[1] = "/zipfile:" + zipFile;
+                args[2] = "/folder:" + folder;
+                args[3] = "/clobber";
+                if (!string.IsNullOrEmpty(mapFile))
+                {
+                    args[4] = "/map:" + mapFile;
+                }
+                else
+                {
+                    args[4] = "";
+                }
+
+                args[5] = "/errorLevel:Warning";
+                args[6] = "/packagetype:" + packageType;
+                if (localize)
+                {
+                    args[7] = "/localize";
+                    args[8] = "/src:1033";
+                }
+                else
+                {
+                    args[7] = "";
+                    args[8] = "";
+                }
+
+                var argString = string.Join(" ", args);
+
+
+                environment.WriteLine(" with arguments " + argString);
+                Process proc = new Process();
+                proc.StartInfo.UseShellExecute = false;
+                proc.StartInfo.RedirectStandardOutput = true;
+                proc.StartInfo.RedirectStandardError = true;
+                proc.StartInfo.FileName = environment.GetSolutionFileName(solutionPackagerLocation);
+                proc.StartInfo.Arguments = argString;
+                proc.StartInfo.WorkingDirectory = workspaceDirectory;
+                proc.OutputDataReceived += outputHandler;
+                proc.ErrorDataReceived += outputHandler;
+                proc.Start();
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+                proc.WaitForExit();
+                environment.WriteLine("Exited with code: " + proc.ExitCode);
+                return proc.ExitCode == 0;
+            }
+        }
+
+        void proc_OutputDataReceived(object sender, DataReceivedEventArgs e)
+        {
+            Environment.WriteLine(e.Data);
+        }
+
+        private void PerformCoreLibrariesImport(ToolSettings settings)
+        {
+            // Update EllucianCoreResources solution first as the DatatelCore solution depends on it.
+            string managedCoreResourcesPath = Path.Combine(settings.WorkspaceDirectory, Options.CoreLocation, _ManagedCoreResources);
+            Environment.WriteLine(string.Format("Updating Core in {0} with managed resources zip {1}", settings.ProductOrganization, managedCoreResourcesPath));
+            ExecuteImportRequest(settings.CreateConnection(settings.ProductOrganization), managedCoreResourcesPath);
+
+            // Update the DatatelCore solution now that the EllucianCoreResources solution has been updated.
+            string managedCorePath = Path.Combine(settings.WorkspaceDirectory, Options.CoreLocation, _ManagedCore);
+            Environment.WriteLine(string.Format("Updating Core in {0} with managed zip {1}", settings.ProductOrganization, managedCorePath));
+            ExecuteImportRequest(settings.CreateConnection(settings.ProductOrganization), managedCorePath);
+        }
+
+        /// <summary>
+        /// Exports managed core solution to a temporary location and updates the core solution in the Recruiter organization
+        /// </summary>
+        /// <param name="settings"></param>
+        private void PerformCoreUpdate(ToolSettings settings)
+        {
+            // Create temp directory for managed core export
+            string tempDir = Path.Combine(settings.CustomizationsDirectory, _UpdateCoreTempLocation);
+            Directory.CreateDirectory(tempDir);
+
+            // Export managed version of the unmanaged solutions in the Core org
+            Environment.Write("Exporting current core managed solution to temporary location...");
+            CrmConnection coreConnection = settings.CreateConnection(settings.CoreOrganization);
+            CrmData data = new CrmData(coreConnection);
+            foreach (var solution in settings.CoreOrganization.Solutions.Where(x => x.Type == SolutionType.Unmanaged))
+            {
+                // Export the managed solution
+                WriteSolutionFile(
+                    coreConnection,
+                    solution.UniqueName,
+                    true,
+                    GetSolutionZipFilePath(solution.UniqueName, tempDir, SolutionType.Managed));
+            }
+            Environment.Write("Done!\n");
+
+            // Update the managed core solution in business organizations
+            CrmConnection recruiterConnection = settings.CreateConnection(settings.ProductOrganization);
+            UpdateManagedCore(recruiterConnection, settings.CoreOrganization, settings.ProductOrganization, tempDir);
+
+            Environment.Write("Deleting temporary files...");
+            // Delete temp directory for managed core export
+            Directory.Delete(tempDir, true);
+            Environment.Write("Done!\n");
+
+            Environment.WriteLine("\nCore update finished!");
+        }
+
+        /// <summary>
+        /// Updates any managed core solutions in the business organization
+        /// </summary>
+        /// <param name="businessConnection"></param>
+        /// <param name="businessOrganization"></param>
+        private void UpdateManagedCore(CrmConnection businessConnection, Organization coreOrganization, Organization businessOrganization, string exportDirectory)
+        {
+            var coreUnmanagedSolutions = (from solution in coreOrganization.Solutions
+                                          where solution.Type == SolutionType.Unmanaged
+                                          select solution.UniqueName).ToList();
+
+            foreach (var businessSolution in businessOrganization.Solutions.Where(x => x.Type == SolutionType.Managed))
+            {
+                if (coreUnmanagedSolutions.Contains(businessSolution.UniqueName, StringComparer.InvariantCultureIgnoreCase))
+                {
+                    Environment.Write("Updating managed core solution {0} on {1}...", businessSolution.UniqueName, businessOrganization.Name);
+
+                    ExecuteImportRequest(businessConnection, GetSolutionZipFilePath(businessSolution.UniqueName, exportDirectory, businessSolution.Type));
+
+                    Environment.WriteLine("Done!");
+                }
+            }
+        }
+
+        private void ExecuteImportRequest(CrmConnection connection, string zipFilePath)
+        {
+            //SolutionImportExportTool
+            //ImportSolutionRequest importRequest = new ImportSolutionRequest();
+            //importRequest.ConvertToManaged = false;
+            //importRequest.OverwriteUnmanagedCustomizations = false;
+            //importRequest.PublishWorkflows = true;
+            //importRequest.CustomizationFile = File.ReadAllBytes(zipFilePath);
+            //ImportSolutionResponse importResponse = (ImportSolutionResponse)connection.OrganizationService.Execute(importRequest);
+
+            ImportSolutionAsyncRequest asyncImportRequest = new ImportSolutionAsyncRequest
+            {
+                CustomizationFile = File.ReadAllBytes(zipFilePath),
+                PublishWorkflows = true,
+                OverwriteUnmanagedCustomizations = false,
+                ConvertToManaged = false
+            };
+            var response = (ImportSolutionAsyncResponse)connection.OrganizationService.Execute(asyncImportRequest);
+            //Guid asyncJobId = resp.AsyncOperationId;
+            var importSucceeded = CheckImportStatus(connection.OrganizationService, response.AsyncOperationId, Guid.Parse(response.ImportJobKey));
+
+        }
+
+        public bool CheckImportStatus(IOrganizationService service, Guid asyncOperationId, Guid importJobKey)
+        {
+            var finished = false;
+            Entity asyncOperation = null;
+            // Wait until the async job is finished
+            while (!finished)
+            {
+                asyncOperation = service.Retrieve("asyncoperation", asyncOperationId, new ColumnSet("statecode", "statuscode"));
+                OptionSetValue statecode = (OptionSetValue)asyncOperation["statecode"];
+                if (statecode.Value == 3)
+                {
+                    finished = true;
+                }
+                else
+                {
+                    Environment.WriteLine($"WaitingForDataverse , {asyncOperationId}, {importJobKey}");
+                    Thread.Sleep(10000);
+                }
+            }
+            // Solution import completed successfully
+            OptionSetValue statuscode = (OptionSetValue)asyncOperation["statuscode"];
+            if (statuscode.Value == 30)
+            {
+                Environment.WriteLine("on prem Import Successful");
+                return true;
+            }
+            else if (statuscode.Value == 31)  // Solution import failed
+            {
+                Environment.WriteLine("ImportFailed");
+                var getLogReq = new RetrieveFormattedImportJobResultsRequest { ImportJobId = importJobKey };
+                var importJob = service.Execute(getLogReq) as RetrieveFormattedImportJobResultsResponse;
+                if (importJob != null)
+                {
+                    Environment.WriteLine($"importJob.FormattedResults");
+                }
+                return false;
+            }
+            return false;
+        }
+        /// <summary>
+        /// Exports managed and unmanaged versions of an unmanaged solution
+        /// </summary>
+        /// <param name="connection"></param>
+        /// <param name="solutionName"></param>
+        /// <param name="customizationsDirectory"></param>
+        private void ExportAndFixSolution(CrmConnection connection, string solutionName, string customizationsDirectory)
+        {
+
+            string unmanagedOriginalZipFilePath = GetOriginalSolutionZipFilePath(customizationsDirectory, solutionName, false);
+            string managedOriginalZipFilePath = GetOriginalSolutionZipFilePath(customizationsDirectory, solutionName, true);
+
+            string unmanagedWorkingZipFilePath = GetWorkingSolutionZipFilePath(customizationsDirectory, solutionName, false);
+            string managedWorkingZipFilePath = GetWorkingSolutionZipFilePath(customizationsDirectory, solutionName, true);
+
+            if (Options.PackUnpack)
+            {
+                if (Options.CheckoutSolutionZips)
+                {
+                    Environment.Write("\nChecking out solution zips...");
+                    SourceControl.CheckOut(unmanagedOriginalZipFilePath, "solution export tool", Tools.SourceControl.GetOption.Replace);
+                    SourceControl.CheckOut(managedOriginalZipFilePath, "solution export tool", Tools.SourceControl.GetOption.Replace);
+                }
+                else
+                {
+                    Environment.Write("\nNOT Checking out solution zips, you should not checkin changes from this export.");
+                    Environment.Write("\nMaking zips writable.");
+                    System.IO.FileInfo fileInfo = new System.IO.FileInfo(unmanagedOriginalZipFilePath);
+                    fileInfo.IsReadOnly = false;
+                    fileInfo = new System.IO.FileInfo(managedOriginalZipFilePath);
+                    fileInfo.IsReadOnly = false;
+                }
+
+                //unzip original zip files to compare customizations file later.
+                UnzipSolution(unmanagedOriginalZipFilePath);
+                UnzipSolution(managedOriginalZipFilePath);
+
+                //MailMergeTemplates are requiring a manual checkout in order to clobber. Bug reported to MS.
+                string mailmergeTemplatesPath = Path.Combine(GetSolutionUnPackedZipFolderPath(solutionName, customizationsDirectory), "Templates", "MailMergeDocuments");
+                if (Directory.Exists(mailmergeTemplatesPath))
+                {
+                    SourceControl.CheckOut(mailmergeTemplatesPath, "preparing for solution export", Tools.SourceControl.GetOption.Replace);
+                    Directory.Delete(mailmergeTemplatesPath, true);
+                }
+            }
+
+            Environment.Write("\nExporting solution {0}...", solutionName);
+            if (!String.IsNullOrEmpty(Options.TargetVersion))
+            {
+                Environment.Write("\nTargeting Version {0}", Options.TargetVersion);
+            }
+            CrmData data = new CrmData(connection);
+
+            WriteSolutionFile(connection, solutionName, false, unmanagedWorkingZipFilePath);
+            WriteSolutionFile(connection, solutionName, true, managedWorkingZipFilePath);
+
+            string unmanagedWorkingDirectory = UnzipSolution(unmanagedWorkingZipFilePath);
+            string managedWorkingDirectory = UnzipSolution(managedWorkingZipFilePath);
+
+            Environment.WriteLine("Done!");
+
+            Environment.WriteLine(String.Format("Sorting and updating OTCs for {0}...", solutionName));
+            CleanUpSolutionCustomizations(solutionName, customizationsDirectory, unmanagedWorkingDirectory);
+            CleanUpSolutionCustomizations(solutionName, customizationsDirectory, managedWorkingDirectory);
+            Environment.WriteLine("Done!");
+
+            // Zip and save over the existing solution package and directory
+            Environment.Write("Saving updated solution {0}...", solutionName);
+            string unmanagedDirectory = UpdateSolutionFiles(solutionName, customizationsDirectory, unmanagedWorkingDirectory, SolutionType.Unmanaged);
+            string managedDirectory = UpdateSolutionFiles(solutionName, customizationsDirectory, managedWorkingDirectory, SolutionType.Managed);
+            //change current directory in order to delete these later
+            Directory.SetCurrentDirectory(Settings.WorkspaceDirectory);
+            Environment.WriteLine("Done!\n");
+
+            Environment.WriteLine("Cleaning up...");
+
+
+            // Clean up working zip files
+            File.Delete(unmanagedWorkingZipFilePath);
+            File.Delete(managedWorkingZipFilePath);
+
+            if (Options.PackUnpack)
+            {
+
+                UnPackForCheckin(GetSolutionUnPackedZipFolderPath(solutionName, customizationsDirectory), unmanagedOriginalZipFilePath);
+
+                //do not keep unzipped directories, unpacker will put in correct location
+                try
+                {
+                    Directory.Delete(unmanagedDirectory, true);
+                    Directory.Delete(managedDirectory, true);
+                }
+                catch (Exception e) // swallow exception, no worries
+                {
+                    Environment.WriteLine(e.Message);
+                }
+            }
+
+            Environment.WriteLine("Done!");
+        }
+
+        /// <summary>
+        /// Overwrites the existing solution directories and zip files with the newly exported files
+        /// </summary>
+        /// <param name="solutionName"></param>
+        /// <param name="customizationsDirectory"></param>
+        /// <param name="workingDirectory"></param>
+        /// <param name="solutionType"></param>
+        private string UpdateSolutionFiles(string solutionName, string customizationsDirectory, string workingDirectory, SolutionType solutionType)
+        {
+            // Remove old directories and rename the working dirs to replace them
+            string solutionDirectory = GetExtractedSolutionDirectory(solutionName, customizationsDirectory, solutionType);
+
+
+            try
+            {
+                Directory.Delete(solutionDirectory, true);
+            }
+            catch (Exception e) // swallow exception in case directory did not exist (not gotten previously)
+            {
+                Environment.WriteLine(e.Message);
+            }
+
+            Thread.Sleep(2000);
+            Directory.Move(workingDirectory, solutionDirectory);
+            Thread.Sleep(2000);
+
+
+            // Zip up the contents and overwrite the old zip files
+            ZipSolutionDirectory(
+                solutionDirectory,
+                GetSolutionZipFilePath(solutionName, customizationsDirectory, solutionType));
+
+            return solutionDirectory;
+
+        }
+
+        private String GetSolutionPackedZipFilePath(string solutionName, string customizationsDirectory)
+        {
+            return Path.Combine(customizationsDirectory, solutionName + _PackedZipSuffix);
+        }
+
+        private String GetSolutionUnPackedZipFolderPath(string solutionName, string customizationsDirectory)
+        {
+            return Path.Combine(customizationsDirectory, solutionName + _UnpackedDirectorySuffix);
+        }
+
+        private string GetSolutionZipFilePath(string solutionName, string customizationsDirectory, SolutionType solutionType)
+        {
+            return Path.Combine(customizationsDirectory, solutionName + GetSolutionTypeSuffix(solutionType) + ".zip");
+        }
+
+        private string GetExtractedSolutionDirectory(string solutionName, string customizationsDirectory, SolutionType solutionType)
+        {
+            return Path.Combine(customizationsDirectory, solutionName + GetSolutionTypeSuffix(solutionType));
+        }
+
+        private string GetSolutionTypeSuffix(SolutionType solutionType)
+        {
+            string suffix = String.Empty;
+
+            switch (solutionType)
+            {
+                case SolutionType.Managed:
+                    suffix = _ManagedSuffix;
+                    break;
+                case SolutionType.Unmanaged:
+                    suffix = _UnmanagedSuffix;
+                    break;
+                default:
+                    throw new InvalidOperationException();
+            }
+            return suffix;
+        }
+
+        private void ZipSolutionDirectory(string solutionDirectory, string zipFilePath)
+        {
+            Directory.SetCurrentDirectory(solutionDirectory);
+            using (ZipFile zipFile = new ZipFile())
+            {
+                zipFile.AddSelectedFiles("*.*", true);
+                zipFile.Save(zipFilePath);
+            }
+        }
+
+        /// <summary>
+        /// Sorts entities and updates OTC values to match previous customizations
+        /// </summary>
+        /// <param name="solutionName"></param>
+        /// <param name="customizationsDirectory"></param>
+        /// <param name="workingDirectory"></param>
+        private void CleanUpSolutionCustomizations(string solutionName, string customizationsDirectory, string workingDirectory)
+        {
+            // Strip any bad dependencies from the solution file and save them in a HashSet so that we can use them to remove
+            // the corresponding entity relationships from the customizations
+            var fullXmlFilePath = Path.Combine(workingDirectory, _SolutionFileName);
+            Environment.WriteLine("Loading XML File ..." + fullXmlFilePath);
+            var solutionFile = XDocument.Load(fullXmlFilePath);
+            Environment.WriteLine("Striping any bad dependencies...");
+            var missingActiveSolutionDependencies = solutionFile.Descendants("MissingDependency").Where(x =>
+                (
+                    (x.Element("Required").Attribute("solution").Value == "Active")
+                    && !(
+                            ((x.Element("Required").Attribute("parentSchemaName") != null)
+                            && (x.Element("Required").Attribute("parentSchemaName").Value.StartsWith("datatel_core")))
+                            ||
+                            ((x.Element("Required").Attribute("schemaName") != null)
+                            && (x.Element("Required").Attribute("schemaName").Value.StartsWith("datatel_core")))
+                    )
+                )).ToList();
+            HashSet<string> badRelationshipEntities = new HashSet<string>();
+            if (missingActiveSolutionDependencies.Count > 0)
+            {
+                foreach (var dependency in missingActiveSolutionDependencies)
+                {
+                    if ((dependency.Element("Required").Attribute("schemaName") != null) && (dependency.Element("Required").Attribute("type").Value == "1"))
+                    {
+                        badRelationshipEntities.Add(dependency.Element("Required").Attribute("schemaName").Value);
+                    }
+                    dependency.Remove();
+                }
+            }
+
+
+
+            //Sort all the missing dependency items        
+            Environment.WriteLine("Sorting the missing dependencies...");
+            var missingDependenciesElement = solutionFile.Descendants("MissingDependencies").FirstOrDefault();
+            if (missingDependenciesElement != null)
+            {
+                var allMissingDependencyItems = missingDependenciesElement.Elements().ToList();
+                SortedList<string, XElement> sortedMissingDependencyItems = new SortedList<string, XElement>();
+                bool success = false;
+                try
+                {
+
+                    foreach (var missing in allMissingDependencyItems)
+                    {
+                        //Create the key from all attributes that are not a key
+                        string key = "";
+                        foreach (var element in missing.Elements())
+                        {
+                            foreach (var attribute in element.Attributes())
+                            {
+                                if (attribute.Name != "key")
+                                {
+                                    key += "_" + attribute.Value;
+                                }
+                            }
+                        }
+                        sortedMissingDependencyItems.Add(key, missing);
+                    }
+                    success = true;
+                }
+                catch (Exception ex)
+                {
+                    Environment.WriteLine("Error sorting missing dependencies, solution export is still fine and usable, this is just something extra for usability that didn't work");
+                    Environment.WriteLine(ex.Message);
+                }
+
+                if (success)
+                {
+                    foreach (var item in allMissingDependencyItems)
+                        item.Remove();
+                    foreach (var item in sortedMissingDependencyItems)
+                        missingDependenciesElement.Add(item.Value);
+                }
+            }
+
+
+            // Sort all the report root component items (31)       
+            Environment.WriteLine("Sorting the report root components...");
+            var rootComponentsElement = solutionFile.Descendants("RootComponents").FirstOrDefault();
+            if (rootComponentsElement != null)
+            {
+                // Get all the root component nodes with a type of 31 (report)
+                var reportItems = rootComponentsElement.Elements().Where(x => x.Attribute("type").Value == "31").ToList();
+                SortedList<string, XElement> sortedReportItems = new SortedList<string, XElement>();
+                bool success = false;
+                try
+                {
+                    // Add each report element to a sorted list
+                    foreach (var report in reportItems)
+                        sortedReportItems.Add(report.Attribute("id").Value, report);
+                    success = true;
+                }
+                catch (Exception ex)
+                {
+                    Environment.WriteLine("Error sorting report root components, solution export is still fine and usable, this is just something extra for usability that didn't work");
+                    Environment.WriteLine(ex.Message);
+                }
+
+                if (success)
+                {
+                    XElement placeHolder = null;
+                    int typeValue = 0;
+                    foreach (var item in reportItems)
+                    {
+                        // Determine the spot where we need to add the sorted nodes
+                        if (placeHolder == null && Int32.TryParse(((XElement)item.PreviousNode).Attribute("type").Value, out typeValue) && typeValue < 31)
+                            placeHolder = item.PreviousNode as XElement;
+                        item.Remove();
+                    }
+                    foreach (var item in sortedReportItems)
+                    {
+                        // If for some reason there were no elements before the reports or they had no type value then just add these to the beginning of the root components
+                        if (placeHolder == null)
+                            rootComponentsElement.AddFirst(item.Value);
+                        // If there were root components before the reports then add these where they should go
+                        else
+                            placeHolder.AddAfterSelf(item.Value);
+                        placeHolder = item.Value;
+                    }
+                }
+            }
+
+
+
+
+            // Update solution version
+            Environment.WriteLine("Updating the solution version...");
+            var versionElement = solutionFile.Root.Element("SolutionManifest").Element("Version");
+            Version version = null;
+            if (Version.TryParse(versionElement.Value, out version))
+            {
+                versionElement.Value = String.Format("{0}.{1}.{2}.{3}", version.Major, version.Minor, version.Build, version.Revision + 1);
+            }
+
+            solutionFile.Save(Path.Combine(workingDirectory, _SolutionFileName));
+
+            // Clean and sort customizations
+            XDocument oldCustomizationsFile = null;
+            if (File.Exists(Path.Combine(customizationsDirectory, solutionName + _ManagedSuffix, _CustomizationsFileName)))
+            {
+                fullXmlFilePath = Path.Combine(customizationsDirectory, solutionName + _ManagedSuffix, _CustomizationsFileName);
+                Environment.WriteLine($"Clean and sort customizations- Loading XML File ...{fullXmlFilePath}");
+                oldCustomizationsFile = XDocument.Load(fullXmlFilePath);
+            }
+            //Parse workflows for problematic GUIDs that change
+            string workflowdir = Path.Combine(customizationsDirectory, solutionName + _ManagedSuffix, "Workflows");
+            if (Directory.Exists(workflowdir))
+            {
+                Dictionary<string, string> stepLabelsByParentDisplayName = new Dictionary<string, string>();
+                //loop through each file and collect problematic GUIDs
+                foreach (var filename in Directory.EnumerateFiles(workflowdir).Where(f => f.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase) ||
+                                 f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)))
+                {
+                    Environment.WriteLine($"Loading XML File from dir {workflowdir}..File:{filename}.");
+                    var xamlFile = XElement.Load(filename);
+                    foreach (var stepLabel in GetStepLabelElements(xamlFile))
+                    {
+                        var defaultGuid = stepLabel.Attribute("Default").Value;
+                        var key = string.Format("{0}-{1}", Path.GetFileNameWithoutExtension(filename), GetStepLabelParentDisplayName(stepLabel));
+                        stepLabelsByParentDisplayName.Add(key, defaultGuid);
+                    }
+                }
+                Environment.WriteLine(string.Format("Found {0} step label elements", stepLabelsByParentDisplayName.Keys.Count));
+                //apply GUID now
+                bool xamlUpdated = false;
+                foreach (var filename in Directory.EnumerateFiles(Path.Combine(workingDirectory, "Workflows")).Where(f => f.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase) ||
+                                 f.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)))
+                {
+                    Environment.WriteLine($"FileName: {filename}");
+                    var xamlFile = XDocument.Load(filename, LoadOptions.PreserveWhitespace);
+
+                    xamlUpdated = false;
+                    foreach (var stepLabel in GetStepLabelElements(xamlFile.Root))
+                    {
+                        var key = string.Format("{0}-{1}", Path.GetFileNameWithoutExtension(filename), GetStepLabelParentDisplayName(stepLabel));
+                        if (stepLabelsByParentDisplayName.ContainsKey(key))
+                        {
+                            stepLabel.Attribute("Default").Value = stepLabelsByParentDisplayName[key];
+                            xamlUpdated = true;
+                        }
+                    }
+                    if (xamlUpdated)
+                    {
+                        XmlWriterSettings xws = new XmlWriterSettings { OmitXmlDeclaration = true, Encoding = new System.Text.UTF8Encoding(false) };
+                        using (XmlWriter xw = XmlWriter.Create(filename, xws))
+                        {
+                            xamlFile.Save(xw);
+                        }
+                    }
+                }
+            }
+            var customizationsFile = XDocument.Load(Path.Combine(workingDirectory, _CustomizationsFileName));
+            customizationsFile = CustomizationSorter.CleanCustomizations(
+                customizationsFile,
+                oldCustomizationsFile,
+                badRelationshipEntities);
+            customizationsFile.Save(Path.Combine(workingDirectory, _CustomizationsFileName));
+        }
+
+        private IEnumerable<XElement> GetStepLabelElements(XElement xamlFile)
+        {
+            return xamlFile.Descendants().Where(x => x.Attribute("Name") != null && x.Attribute("Name").Value == "stepLabelLabelId");
+        }
+
+        private string GetStepLabelParentDisplayName(XElement steplabel)
+        {
+            return steplabel.Parent.Parent.Attribute("DisplayName").Value;
+        }
+
+        /// <summary>
+        /// Unzipes solution file and returns path to contents
+        /// </summary>
+        /// <param name="zipFilePath"></param>
+        /// <returns></returns>
+        private string UnzipSolution(string zipFilePath)
+        {
+            string unpackDirectory = Path.ChangeExtension(zipFilePath, null);
+            using (ZipFile zipFile = ZipFile.Read(zipFilePath))
+            {
+                foreach (ZipEntry e in zipFile)
+                {
+                    e.Extract(unpackDirectory, ExtractExistingFileAction.OverwriteSilently);
+                }
+
+            }
+            return unpackDirectory;
+        }
+
+        /// <summary>
+        /// Exports the solution, writes it to the file system, and returns the path to the zip file
+        /// </summary>
+        /// <param name="connection"></param>
+        /// <param name="solutionName"></param>
+        /// <param name="customizationsDirectory"></param>
+        /// <param name="managed"></param>
+        /// <returns></returns>
+        private void WriteSolutionFile(CrmConnection connection, string solutionName, bool managed, string filePath)
+        {
+            if (Settings.OnlineCrm)
+            {
+                pacCliHelper.SolutionExport(managed, filePath, solutionName);
+            }
+            else
+            {
+                byte[] workingExport = ExecuteExportRequest(connection, solutionName, managed);
+                File.WriteAllBytes(filePath, workingExport);
+            }
+        }
+
+
+        private string GetWorkingSolutionZipFilePath(string exportDirectory, string solutionName, bool managed)
+        {
+            return Path.Combine(exportDirectory, "working_" + solutionName + ((managed) ? "_managed" : "")) + ".zip";
+        }
+
+        private string GetOriginalSolutionZipFilePath(string exportDirectory, string solutionName, bool managed)
+        {
+            return Path.Combine(exportDirectory, solutionName + ((managed) ? "_managed" : "")) + ".zip";
+        }
+
+        private void PerformImport(ToolSettings settings, TargetOrganization organization)
+        {
+            if (organization == TargetOrganization.Both || organization == TargetOrganization.Core)
+            {
+                ImportOrganizationSolutions(settings.CreateConnection(settings.CoreOrganization), settings.CoreOrganization, settings.CustomizationsDirectory);
+            }
+            if (organization == TargetOrganization.Both || organization == TargetOrganization.Business)
+            {
+                ImportOrganizationSolutions(settings.CreateConnection(settings.ProductOrganization), settings.ProductOrganization, settings.CustomizationsDirectory);
+            }
+
+            Environment.WriteLine("\nSolution import finished!");
+        }
+
+        private void ImportOrganizationSolutions(CrmConnection connection, Organization organization, string customizationsDirectory)
+        {
+
+            bool importReady = true;
+            string zipFilePath = null;
+            foreach (var solution in organization.Solutions)
+            {
+
+                if (Options.PackUnpack && solution.Type == SolutionType.Unmanaged)
+                {
+                    zipFilePath = GetSolutionPackedZipFilePath(solution.UniqueName, customizationsDirectory);
+                    importReady = PackForImport(GetSolutionUnPackedZipFolderPath(solution.UniqueName, customizationsDirectory), zipFilePath);
+                }
+                else
+                {
+                    zipFilePath = GetSolutionZipFilePath(solution.UniqueName, customizationsDirectory, solution.Type);
+                }
+                if (importReady)
+                {
+                    Environment.Write("\nImporting {0} solution {1} into {2}...", solution.Type.ToString().ToLower(), solution.UniqueName, organization.Name);
+                    Environment.WriteLine("File: " + zipFilePath);
+                    ExecuteImportRequest(connection, zipFilePath);
+                    Environment.Write("Done!\n");
+
+                    //delete PackedZip
+                    if (Options.PackUnpack && solution.Type == SolutionType.Unmanaged)
+                    {
+                        Environment.WriteLine(string.Format("Deleting temporary packed zip file {0}...", zipFilePath));
+                        try
+                        {
+                            // Clean up working zip files
+                            File.Delete(zipFilePath);
+                        }
+                        catch (Exception e)
+                        {
+                            Environment.WriteLine(string.Format("Deletion failed: {0}", e.Message));
+                        }
+                    }
+                }
+                else
+                {
+                    Environment.WriteLine("!!Solution packer failed, skipping import!!");
+                    break;
+                }
+            }
+
+            // Publish all customizations
+            if (importReady)
+            {
+                Environment.Write("Publishing all customizations in {0}...", organization.Name);
+                connection.OrganizationService.Execute(new PublishAllXmlRequest());
+                Environment.Write("Done!\n");
+            }
+        }
+
+        private byte[] ExecuteExportRequest(CrmConnection connection, string solutionName, bool managed)
+        {
+            ExportSolutionRequest exportSolutionRequest = new ExportSolutionRequest();
+            exportSolutionRequest.Managed = managed;
+            exportSolutionRequest.SolutionName = solutionName;
+            if (!String.IsNullOrEmpty(Options.TargetVersion))
+            {
+                exportSolutionRequest.TargetVersion = Options.TargetVersion;
+            }
+            ExportSolutionResponse exportSolutionResponse = (ExportSolutionResponse)connection.OrganizationService.Execute(exportSolutionRequest);
+            return exportSolutionResponse.ExportSolutionFile;
         }
     }
-    // Solution import completed successfully
-    OptionSetValue statuscode = (OptionSetValue)asyncOperation["statuscode"];
-    if (statuscode.Value == 30)
-    {
-        Environment.WriteLine("on prem Import Successful");
-        return true;
-    }
-    else if (asyncOperation["statuscode"].ToString() == "31")  // Solution import failed
-    {
-        Environment.WriteLine("ImportFailed");
-        var getLogReq = new RetrieveFormattedImportJobResultsRequest { ImportJobId = importJobKey };
-        var importJob = service.Execute(getLogReq) as RetrieveFormattedImportJobResultsResponse;
-        if (importJob != null)
-        {
-            Environment.WriteLine($"importJob.FormattedResults");
-        }
-        return false;
-    }
-    return false;
 }
