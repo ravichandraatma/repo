@@ -1,0 +1,62 @@
+private void ExecuteImportRequest(CrmConnection connection, string zipFilePath)
+{
+    //SolutionImportExportTool
+    //ImportSolutionRequest importRequest = new ImportSolutionRequest();
+    //importRequest.ConvertToManaged = false;
+    //importRequest.OverwriteUnmanagedCustomizations = false;
+    //importRequest.PublishWorkflows = true;
+    //importRequest.CustomizationFile = File.ReadAllBytes(zipFilePath);
+    //ImportSolutionResponse importResponse = (ImportSolutionResponse)connection.OrganizationService.Execute(importRequest);
+
+    ImportSolutionAsyncRequest asyncImportRequest = new ImportSolutionAsyncRequest
+    {
+        CustomizationFile = File.ReadAllBytes(zipFilePath),
+        PublishWorkflows = true,
+        OverwriteUnmanagedCustomizations = false,
+        ConvertToManaged = false
+    };
+    var response = (ImportSolutionAsyncResponse)connection.OrganizationService.Execute(asyncImportRequest);
+    //Guid asyncJobId = resp.AsyncOperationId;
+    var importSucceeded = CheckImportStatus(connection.OrganizationService, response.AsyncOperationId, Guid.Parse(response.ImportJobKey));
+
+}
+
+public bool CheckImportStatus(IOrganizationService service, Guid asyncOperationId, Guid importJobKey)
+{
+    var finished = false;
+    Entity asyncOperation = null;
+    // Wait until the async job is finished
+    while (!finished)
+    {
+        asyncOperation = service.Retrieve("asyncoperation", asyncOperationId, new ColumnSet("statecode", "statuscode"));
+        OptionSetValue statecode = (OptionSetValue)asyncOperation["statecode"];
+        if (statecode.Value == 3)
+        {
+            finished = true;
+        }
+        else
+        {
+            Environment.WriteLine($"WaitingForDataverse , {asyncOperationId}, {importJobKey}");
+            Thread.Sleep(10000);
+        }
+    }
+    // Solution import completed successfully
+    OptionSetValue statuscode = (OptionSetValue)asyncOperation["statuscode"];
+    if (statuscode.Value == 30)
+    {
+        Environment.WriteLine("on prem Import Successful");
+        return true;
+    }
+    else if (asyncOperation["statuscode"].ToString() == "31")  // Solution import failed
+    {
+        Environment.WriteLine("ImportFailed");
+        var getLogReq = new RetrieveFormattedImportJobResultsRequest { ImportJobId = importJobKey };
+        var importJob = service.Execute(getLogReq) as RetrieveFormattedImportJobResultsResponse;
+        if (importJob != null)
+        {
+            Environment.WriteLine($"importJob.FormattedResults");
+        }
+        return false;
+    }
+    return false;
+}
