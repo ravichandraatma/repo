@@ -1,4 +1,3 @@
-https://ellucian.visualstudio.com/CRMCommon/_git/CRMCommon
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -17,6 +16,7 @@ using System.Xml;
 using System.Threading;
 using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Query;
+using Microsoft.Xrm.Sdk.Messages;
 
 namespace Ellucian.Crm.Tools.Core
 {
@@ -349,28 +349,26 @@ namespace Ellucian.Crm.Tools.Core
 
         private void ExecuteImportRequest(CrmConnection connection, string zipFilePath)
         {
-            //SolutionImportExportTool
-            //ImportSolutionRequest importRequest = new ImportSolutionRequest();
-            //importRequest.ConvertToManaged = false;
-            //importRequest.OverwriteUnmanagedCustomizations = false;
-            //importRequest.PublishWorkflows = true;
-            //importRequest.CustomizationFile = File.ReadAllBytes(zipFilePath);
-            //ImportSolutionResponse importResponse = (ImportSolutionResponse)connection.OrganizationService.Execute(importRequest);
+            Guid? asyncJobId = null;
+            ImportSolutionRequest importRequest = new ImportSolutionRequest();
+            importRequest.ConvertToManaged = false;
+            importRequest.OverwriteUnmanagedCustomizations = false;
+            importRequest.PublishWorkflows = true;
+            importRequest.CustomizationFile = File.ReadAllBytes(zipFilePath);
+            ImportSolutionResponse importResponse = (ImportSolutionResponse)connection.OrganizationService.Execute(importRequest);
 
-            ImportSolutionAsyncRequest asyncImportRequest = new ImportSolutionAsyncRequest
+            ExecuteAsyncRequest asyncRequest = new ExecuteAsyncRequest()
             {
-                CustomizationFile = File.ReadAllBytes(zipFilePath),
-                PublishWorkflows = true,
-                OverwriteUnmanagedCustomizations = false,
-                ConvertToManaged = false
+                Request = importRequest
             };
-            var response = (ImportSolutionAsyncResponse)connection.OrganizationService.Execute(asyncImportRequest);
-            //Guid asyncJobId = resp.AsyncOperationId;
-            var importSucceeded = CheckImportStatus(connection.OrganizationService, response.AsyncOperationId, Guid.Parse(response.ImportJobKey));
-
+            ExecuteAsyncResponse asyncResponse = connection.OrganizationService.Execute(asyncRequest) as ExecuteAsyncResponse;
+            asyncJobId = asyncResponse.AsyncJobId;
+            Environment.WriteLine($"solutionImportRequest asyncRequest started with AsyncJobId {asyncJobId} ");
+            var importSucceeded = CheckImportStatus(connection.OrganizationService, asyncResponse.AsyncJobId, Guid.NewGuid(), false);
+            //result = importSucceeded;
         }
 
-        public bool CheckImportStatus(IOrganizationService service, Guid asyncOperationId, Guid importJobKey)
+        public bool CheckImportStatus(IOrganizationService service, Guid asyncOperationId, Guid importJobKey, bool isOnline = true)
         {
             var finished = false;
             Entity asyncOperation = null;
@@ -396,7 +394,7 @@ namespace Ellucian.Crm.Tools.Core
                 Environment.WriteLine("on prem Import Successful");
                 return true;
             }
-            else if (statuscode.Value == 31)  // Solution import failed
+            else if (statuscode.Value == 31 || statuscode.Value == 32 || statuscode.Value == 21 || statuscode.Value == 22)  // Solution import failed
             {
                 Environment.WriteLine("ImportFailed");
                 var getLogReq = new RetrieveFormattedImportJobResultsRequest { ImportJobId = importJobKey };
